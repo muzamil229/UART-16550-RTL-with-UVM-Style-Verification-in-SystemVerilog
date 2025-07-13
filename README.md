@@ -1,0 +1,2 @@
+# UART-16550-RTL-with-UVM-Style-Verification-in-SystemVerilog
+This repository contains a SystemVerilog implementation of the UART 16550 protocol and its corresponding testbench. The testbench follows a UVM-style structure with object-oriented components for input stimulus generation and output checking. The design includes transmitter, receiver, FIFOs, baud rate generator, and control/status registers.
