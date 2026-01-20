@@ -1,61 +1,224 @@
 `timescale 1ns/1ps
-module all_mod_tb;
 
-reg clk, rst, wr, rd;
-reg rx;
-reg [2:0] addr;
-reg [7:0] din;
-wire tx;
-wire [7:0] dout;
-
-all_mod dut (clk, rst, wr, rd, rx, addr, din, tx, dout);
-
-always #5 clk = ~clk;
-
-initial begin
-  clk = 0; rst = 0; wr = 0; rd = 0; addr = 0; din = 0; rx = 1;
-end
-
-// CONFIGURE UART
-initial begin
-
-  rst = 1;
-  repeat(5) @(posedge clk);
-  rst = 0;
-
-  @(negedge clk); wr = 1; addr = 3'h3; din = 8'b1000_0000; // DLAB = 1
-  @(negedge clk); addr = 3'h0; din = 8'b0000_1000;         // LSB = 8
-  @(negedge clk); addr = 3'h1; din = 8'b0000_0001;         // MSB = 1
-  @(negedge clk); addr = 3'h3; din = 8'b0000_1111;         // DLAB = 0, WLS=00, PEN=1, EPS=0
-  @(negedge clk); wr = 0; rd = 0;
-
-  @(posedge dut.uart_tx_inst.sreg_empty);
-  repeat(48) @(posedge dut.uart_tx_inst.baud_pulse);
-
-  $stop;
-end
-
-// RX BIT STREAM
-initial begin
-  reg [7:0] rx_reg = 8'h45;
+// ============================================================
+// INTERFACE
+// ============================================================
+interface uart_if;
+  logic clk;
+  logic rst;
+  logic wr;
+  logic rd;
+  logic rx;
+  logic tx;
+  logic [2:0] addr;
+  logic [7:0] din;
+  logic [7:0] dout;
+endinterface
 
 
-  rx = 0; // start bit
-  repeat (16) @(posedge dut.uart_regs_inst.baud_out);
+// ============================================================
+// TRANSACTION
+// ============================================================
+class uart_txn;
+  bit [7:0] data;
+endclass
 
-  for (int i = 0; i < 8; i++) begin
-    #1;
-    rx = rx_reg[i];
-    repeat (16) @(posedge dut.uart_regs_inst.baud_out);
+
+// ============================================================
+// GENERATOR
+// ============================================================
+class uart_generator;
+  mailbox gen2drv;
+
+  function new(mailbox m);
+    gen2drv = m;
+  endfunction
+
+  task run();
+    uart_txn t;
+    t = new();
+    t.data = 8'h45; // EXACT SAME RX BYTE AS YOUR TB
+    gen2drv.put(t);
+    $display("[GEN] RX DATA = 0x%0h", t.data);
+  endtask
+endclass
+
+
+// ============================================================
+// DRIVER (REGISTER CONFIG + RX BIT STREAM)
+// ============================================================
+class uart_driver;
+  virtual uart_if vif;
+  mailbox gen2drv;
+
+  function new(virtual uart_if vif, mailbox m);
+    this.vif = vif;
+    this.gen2drv = m;
+  endfunction
+
+  task configure_uart();
+    @(negedge vif.clk); vif.wr = 1; vif.addr = 3'h3; vif.din = 8'b1000_0000;
+    @(negedge vif.clk); vif.addr = 3'h0; vif.din = 8'b0000_1000;
+    @(negedge vif.clk); vif.addr = 3'h1; vif.din = 8'b0000_0001;
+    @(negedge vif.clk); vif.addr = 3'h3; vif.din = 8'b0000_1111;
+    @(negedge vif.clk); vif.wr = 0;
+  endtask
+
+  task drive_rx();
+    uart_txn t;
+    gen2drv.get(t);
+
+    vif.rx = 0; // start bit
+    repeat (16) @(posedge tb.dut.uart_regs_inst.baud_out);
+
+    for (int i = 0; i < 8; i++) begin
+      vif.rx = t.data[i];
+      repeat (16) @(posedge tb.dut.uart_regs_inst.baud_out);
+    end
+
+    vif.rx = ~^t.data; // odd parity
+    repeat (16) @(posedge tb.dut.uart_regs_inst.baud_out);
+
+    vif.rx = 1; // stop bit
+    repeat (16) @(posedge tb.dut.uart_regs_inst.baud_out);
+  endtask
+
+  task run();
+    configure_uart();
+    drive_rx();
+  endtask
+endclass
+
+
+// ============================================================
+// MONITOR
+// ============================================================
+class uart_monitor;
+  virtual uart_if vif;
+  mailbox mon2sb;
+
+  function new(virtual uart_if vif, mailbox m);
+    this.vif = vif;
+    this.mon2sb = m;
+  endfunction
+
+  task run();
+    uart_txn t;
+    t = new();
+    @(posedge vif.rd);
+    t.data = vif.dout;
+    $display("[MON] RX DATA = 0x%0h", t.data);
+    mon2sb.put(t);
+  endtask
+endclass
+
+
+// ============================================================
+// SCOREBOARD
+// ============================================================
+class uart_scoreboard;
+  mailbox gen2sb;
+  mailbox mon2sb;
+
+  function new(mailbox g, mailbox m);
+    gen2sb = g;
+    mon2sb = m;
+  endfunction
+
+  task run();
+    uart_txn exp, act;
+    gen2sb.get(exp);
+    mon2sb.get(act);
+
+    if (exp.data === act.data)
+      $display("[SB PASS] DATA MATCH = 0x%0h", act.data);
+    else
+      $error("[SB FAIL] EXP=0x%0h GOT=0x%0h", exp.data, act.data);
+  endtask
+endclass
+
+
+// ============================================================
+// TOP TESTBENCH
+// ============================================================
+module tb;
+
+  uart_if uif();
+
+  mailbox gen2drv = new();
+  mailbox gen2sb  = new();
+  mailbox mon2sb  = new();
+
+  uart_generator  gen;
+  uart_driver     drv;
+  uart_monitor    mon;
+  uart_scoreboard sb;
+
+  // DUT
+  all_mod dut (
+    .clk  (uif.clk),
+    .rst  (uif.rst),
+    .wr   (uif.wr),
+    .rd   (uif.rd),
+    .rx   (uif.rx),
+    .addr (uif.addr),
+    .din  (uif.din),
+    .tx   (uif.tx),
+    .dout (uif.dout)
+  );
+
+  // Clock
+  always #5 uif.clk = ~uif.clk;
+
+  // Reset
+  initial begin
+    uif.clk = 0;
+    uif.rst = 1;
+    uif.wr  = 0;
+    uif.rd  = 0;
+    uif.addr = 0;
+    uif.din  = 0;
+    uif.rx   = 1;
+    repeat (5) @(posedge uif.clk);
+    uif.rst = 0;
   end
 
-  rx = ~^rx_reg[7:0]; // odd parity
-  repeat (16) @(posedge dut.uart_regs_inst.baud_out);
+  // Read RX register
+  initial begin
+    @(posedge dut.uart_rx_inst.rx_done);
+    @(negedge uif.clk);
+    uif.rd = 1;
+    uif.addr = 3'h0;
+    @(negedge uif.clk);
+    uif.rd = 0;
+  end
 
-  rx = 1; // stop bit
-  repeat (16) @(posedge dut.uart_regs_inst.baud_out);
+  // Environment
+  initial begin
+    gen = new(gen2drv);
+    drv = new(uif, gen2drv);
+    mon = new(uif, mon2sb);
+    sb  = new(gen2sb, mon2sb);
 
-  $finish;
-end
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      sb.run();
+    join_none
+  end
+
+  // Expected data feed
+  initial begin
+    uart_txn t;
+    gen2drv.peek(t);
+    gen2sb.put(t);
+  end
+
+  initial begin
+    #200_000;
+    $display("=== UART UVM-STYLE TEST COMPLETE ===");
+    $finish;
+  end
 
 endmodule
