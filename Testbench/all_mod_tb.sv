@@ -208,7 +208,7 @@ module tb;
     join_none
   end
 
-  // Expected data feed
+
   initial begin
     uart_txn t;
     gen2drv.peek(t);
